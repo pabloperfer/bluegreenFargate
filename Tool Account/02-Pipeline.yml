@@ -1,0 +1,627 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: Deploys the CodePipeline in the tool account.
+
+Metadata: 
+ AWS::CloudFormation::Interface: 
+   ParameterGroups: 
+    Label: 
+      default: "CodeCommit"
+      Parameters: 
+        - pBranchName
+    Label: 
+      default: "Docker"
+      Parameters: 
+        - pDockerHubUserName
+        - pECRRepoApp
+
+    Label: 
+      default: "Accounts"
+      Parameters: 
+         - pDevAccountId
+         - pStgAccountId
+         - pProdAccountId
+    Label: 
+      default: "Exporting Stacks"
+      Parameters: 
+         - pSourcesStackName
+         - pNetworkStackNameDev
+         - pNetworkStackNameStg
+         - pNetworkStackNameProd
+   
+        
+Parameters:
+  pBranchName:
+    Type: String
+    AllowedPattern: ^[a-zA-Z0-9\-\_]{3,30}$
+    Default: development
+    Description: CodeCommit branch name
+
+  pDockerHubUserName:
+    Type: String
+    AllowedPattern: ^[a-z0-9]{4,30}$
+    Description: User name for dockerhub for pull public source Docker image.
+
+  pDockerHubSecret:
+    Type: String
+    Default: MyDockerPass
+    Description: Password for dockerhub 
+
+
+  pDevAccountId:
+    Type: String
+    AllowedPattern: '^\d{12}$'
+    Description: Dev account id
+  pStgAccountId:
+    Type: String
+    AllowedPattern: '^\d{12}$'
+    Description: Staging account id
+  pProdAccountId:
+    Type: String
+    AllowedPattern: '^\d{12}$'
+    Description: Production account id
+
+  pSourcesStackName:
+    Type: String
+    Default: Sources
+    Description: Stack name where the source resources for the CodePipeline are available
+
+  pNetworkStackNameDev:
+    AllowedPattern: (^StackSet-)\S+
+    Type: String
+    Description: Stack name where the networking resources were deployed for Development account
+  pNetworkStackNameStg:
+    AllowedPattern: (^StackSet-)\S+
+    Type: String
+    Description: Stack name where the networking resources were deployed for Staging account
+  pNetworkStackNameProd:
+    AllowedPattern: (^StackSet-)\S+
+    Type: String
+    Description: Stack name where the networking resources were deployed for Production account
+
+  pECRRepoApp:
+    Type: String
+    Default: project/app 
+    Description: ECR repo for the application
+
+ 
+Resources:
+  rCodePipeline:
+    Type: AWS::CodePipeline::Pipeline
+    Properties:
+      ArtifactStore:
+        Type: S3
+        EncryptionKey:
+          Id:
+            Fn::ImportValue:
+              !Sub "${pSourcesStackName}-rKMSCodePipelineKeyId"
+          Type: KMS
+        Location: 
+          Fn::ImportValue:
+            !Sub "${pSourcesStackName}-rS3ArtifactBucket"
+      Stages:
+        - Name: Source
+          Actions:
+            - Name: App
+              ActionTypeId:
+                Category: Source
+                Owner: AWS
+                Provider: CodeCommit
+                Version: 1
+              Configuration:
+                BranchName: !Ref pBranchName
+                RepositoryName:
+                  Fn::ImportValue:
+                    !Sub "${pSourcesStackName}-CodeCommitAppRepoName"
+                PollForSourceChanges: true
+              OutputArtifacts:
+                - Name: App
+              RunOrder: 1
+            - Name: Template
+              ActionTypeId:
+                Category: Source
+                Owner: AWS
+                Provider: S3
+                Version: 1
+              Configuration:
+                S3Bucket:
+                  Fn::ImportValue:
+                    !Sub "${pSourcesStackName}-rS3SourceBucket"
+                S3ObjectKey: templates.zip
+              OutputArtifacts:
+                - Name: Template
+              RunOrder: 1
+            - Name: Scripts
+              ActionTypeId:
+                Category: Source
+                Owner: AWS
+                Provider: S3
+                Version: 1
+              Configuration:
+                S3Bucket:
+                  Fn::ImportValue:
+                    !Sub "${pSourcesStackName}-rS3SourceBucket"
+                S3ObjectKey: scripts.zip
+              OutputArtifacts:
+                - Name: Scripts
+              RunOrder: 1
+
+        - Name: Build
+          Actions:
+            - Name: Build
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Provider: CodeBuild
+                Version: 1
+              Configuration:
+                ProjectName: !Ref rAppImageCodeBuildProject
+              InputArtifacts:
+                - Name: App
+              OutputArtifacts:
+                - Name: BuildOutput
+              RunOrder: 2
+        
+        - Name: DiscoveryDev
+          Actions:
+            - Name: Discovery
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Provider: CodeBuild
+                Version: 1
+              Configuration:
+                ProjectName: !Ref BlueGreenElbDiscoveryDev
+              InputArtifacts:
+                - Name: Scripts
+              OutputArtifacts:
+                - Name: DiscoveryOutputDev
+              RunOrder: 1
+
+        - Name: Deploy-Dev
+          Actions:
+            - Name: Deploy
+              ActionTypeId:
+                Category: Deploy
+                Owner: AWS
+                Provider: CloudFormation
+                Version: 1
+              Configuration:
+                ActionMode: CREATE_UPDATE
+                Capabilities: CAPABILITY_NAMED_IAM,CAPABILITY_AUTO_EXPAND
+                ChangeSetName: Deploy
+                ParameterOverrides: !Sub 
+                    - |
+                      {
+                        "pCode1" : { "Fn::GetParam" : [ "DiscoveryOutputDev", "cf_inputs.json", "Code1" ] },
+                        "pCode2" : { "Fn::GetParam" : [ "DiscoveryOutputDev", "cf_inputs.json", "Code2" ] },
+                        "pRepository": "${ECRRepoName}",
+              
+                        "pTemplateBucket": "${S3SourceBucket}",
+                        "pNetworkStackName":"${pNetworkStackNameDev}"
+                      }
+                    - ECRRepoName: !ImportValue Sources-rECRRepoApp
+                      S3SourceBucket: !ImportValue Sources-rS3SourceBucket                     
+                RoleArn: !Sub arn:${AWS::Partition}:iam::${pDevAccountId}:role/CFNRole
+                StackName: Fargate-Cluster 
+                TemplatePath: Template::templates/01-FargateCluster.yml
+              InputArtifacts:
+                - Name: DiscoveryOutputDev
+                - Name: Template
+              RoleArn: !Sub arn:${AWS::Partition}:iam::${pDevAccountId}:role/CrossAccount
+              RunOrder: 1
+
+            - Name: swap-target-group-dev
+              ActionTypeId:
+                Category: Invoke
+                Owner: AWS
+                Provider: Lambda
+                Version: 1
+              Configuration:
+                FunctionName: !Ref rBlueGreenFlipLambda
+                UserParameters: !Sub |
+                  {
+                    "ElbName": "ProjectALB",
+                    "assume_role_arn" : "arn:aws:iam::${pDevAccountId}:role/rCrossLambdaRole"
+                  }
+              RunOrder: 2
+
+        - Name: DiscoveryStg
+          Actions:
+            - Name: Discovery
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Provider: CodeBuild
+                Version: 1
+              Configuration:
+                ProjectName: !Ref BlueGreenElbDiscoveryStg
+              InputArtifacts:
+                - Name: Scripts
+              OutputArtifacts:
+                - Name: DiscoveryOutputStg
+              RunOrder: 1
+
+        - Name: Deploy-Approve-Swap-Stg
+          Actions:
+            - Name: Deploy
+              ActionTypeId:
+                Category: Deploy
+                Owner: AWS
+                Provider: CloudFormation
+                Version: 1
+              Configuration:
+                ActionMode: CREATE_UPDATE
+                Capabilities: CAPABILITY_NAMED_IAM,CAPABILITY_AUTO_EXPAND
+                ChangeSetName: Deploy
+                ParameterOverrides: !Sub 
+                    - |
+                      {
+                      "pCode1" : { "Fn::GetParam" : [ "DiscoveryOutputStg", "cf_inputs.json", "Code1" ] },
+                      "pCode2" : { "Fn::GetParam" : [ "DiscoveryOutputStg", "cf_inputs.json", "Code2" ] },
+                      "pRepository": "${ECRRepoName}",
+                      "pTemplateBucket": "${S3SourceBucket}",
+                      "pNetworkStackName":"${pNetworkStackNameStg}"
+
+                      }
+                    - ECRRepoName: !ImportValue Sources-rECRRepoApp
+                      S3SourceBucket: !ImportValue Sources-rS3SourceBucket
+
+                RoleArn: !Sub arn:${AWS::Partition}:iam::${pStgAccountId}:role/CFNRole
+                StackName: Fargate-Cluster 
+                TemplatePath: Template::templates/01-FargateCluster.yml
+              InputArtifacts:
+                - Name: DiscoveryOutputStg
+                - Name: Template
+              RoleArn: !Sub arn:${AWS::Partition}:iam::${pStgAccountId}:role/CrossAccount
+              RunOrder: 1
+            - Name: approve-blue-green-swap-stg
+              ActionTypeId:
+                Category: Approval
+                Owner: AWS
+                Provider: Manual
+                Version: 1
+              Configuration:
+                CustomData: "Do you want to continue with blue-green swap ?"
+                NotificationArn:
+                  Fn::ImportValue:
+                    !Sub "${pSourcesStackName}-rSNSTopic"
+              RunOrder: 2
+            - Name: swap-target-group-stg
+              ActionTypeId:
+                Category: Invoke
+                Owner: AWS
+                Provider: Lambda
+                Version: 1
+              Configuration:
+                FunctionName: !Ref rBlueGreenFlipLambda
+                UserParameters: !Sub |
+                  {
+                    "ElbName": "ProjectALB",
+                    "assume_role_arn" : "arn:${AWS::Partition}:iam::${pStgAccountId}:role/rCrossLambdaRole"
+                  }
+              RunOrder: 3
+     
+
+        - Name: DiscoveryProd
+          Actions:
+            - Name: Discovery
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Provider: CodeBuild
+                Version: 1
+              Configuration:
+                ProjectName: !Ref BlueGreenElbDiscoveryProd
+              InputArtifacts:
+                - Name: Scripts
+              OutputArtifacts:
+                - Name: DiscoveryOutputProd
+              RunOrder: 1
+        - Name: Deploy-Approve-Swap-Prod
+          Actions:
+            - Name: Deploy
+              ActionTypeId:
+                Category: Deploy
+                Owner: AWS
+                Provider: CloudFormation
+                Version: 1
+              Configuration:
+                ActionMode: CREATE_UPDATE
+                Capabilities: CAPABILITY_NAMED_IAM,CAPABILITY_AUTO_EXPAND
+                ChangeSetName: Deploy
+                ParameterOverrides: !Sub 
+                    - |
+                      {
+                      "pCode1" : { "Fn::GetParam" : [ "DiscoveryOutputProd", "cf_inputs.json", "Code1" ] },
+                      "pCode2" : { "Fn::GetParam" : [ "DiscoveryOutputProd", "cf_inputs.json", "Code2" ] },
+                      "pRepository": "${ECRRepoName}",
+                      
+                      "pTemplateBucket": "${S3SourceBucket}",
+                      "pNetworkStackName":"${pNetworkStackNameProd}"
+                      }
+                    - ECRRepoName: !ImportValue Sources-rECRRepoApp
+                      S3SourceBucket: !ImportValue Sources-rS3SourceBucket     
+                RoleArn: !Sub arn:${AWS::Partition}:iam::${pProdAccountId}:role/CFNRole
+                StackName: Fargate-Cluster 
+                TemplatePath: Template::templates/01-FargateCluster.yml
+              InputArtifacts:
+                - Name: DiscoveryOutputProd
+                - Name: Template
+              RoleArn: !Sub arn:${AWS::Partition}:iam::${pProdAccountId}:role/CrossAccount
+              RunOrder: 1
+            - Name: approve-blue-green-swap-prod
+              ActionTypeId:
+                Category: Approval
+                Owner: AWS
+                Provider: Manual
+                Version: 1
+              Configuration:
+                CustomData: "Do you want to continue with blue-green swap ?"
+                NotificationArn:
+                  Fn::ImportValue:
+                    !Sub "${pSourcesStackName}-rSNSTopic"
+              RunOrder: 2
+            - Name: swap-target-group-prod
+              ActionTypeId:
+                Category: Invoke
+                Owner: AWS
+                Provider: Lambda
+                Version: 1
+              Configuration:
+                FunctionName: !Ref rBlueGreenFlipLambda
+                UserParameters: !Sub |
+                  {
+                    "ElbName": "ProjectALB",
+                    "assume_role_arn" : "arn:${AWS::Partition}:iam::${pProdAccountId}:role/rCrossLambdaRole"
+                  }
+              RunOrder: 3
+      RoleArn:
+        Fn::ImportValue:
+          !Sub "${pSourcesStackName}-rCodePipelineRoleArn"
+      
+      Tags:
+        - Key: Project
+          Value: ProjectALB
+    
+#CodeBuild Projects
+
+  BlueGreenElbDiscoveryDev:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Artifacts:
+        Type: CODEPIPELINE
+      Source:
+        Type: CODEPIPELINE
+        BuildSpec: |
+          version: 0.2
+          phases:
+            install:
+              commands:
+                - apt-get update -y
+                - pip install --upgrade awscli
+                - pip install --upgrade boto3
+                - apt-get install -y jq
+            pre_build:
+              commands:
+                - aws sts get-caller-identity
+                - TEMP_ROLE=`aws sts assume-role --role-arn ${assume_role_arn} --role-session-name test --region ${AWS_DEFAULT_REGION} --endpoint-url https://sts.${AWS_DEFAULT_REGION}.amazonaws.com`
+                - export TEMP_ROLE
+                - echo $TEMP_ROLE
+                - aws sts get-caller-identity
+                - export AWS_ACCESS_KEY_ID_Target=$(echo "${TEMP_ROLE}" | jq -r '.Credentials.AccessKeyId')
+                - export AWS_SECRET_ACCESS_KEY_Target=$(echo "${TEMP_ROLE}" | jq -r '.Credentials.SecretAccessKey')
+                - export AWS_SESSION_TOKEN_Target=$(echo "${TEMP_ROLE}" | jq -r '.Credentials.SessionToken')
+                - pip install awscli --upgrade --user
+                - echo `aws --version`
+                - ls -ld $(find .)
+                - python deployer.py
+          artifacts:
+            files: cf_inputs.json
+            discard-paths: yes
+      Environment:
+        ComputeType: "BUILD_GENERAL1_SMALL"
+        Image: aws/codebuild/python:3.6.5
+        Type: "LINUX_CONTAINER"
+        EnvironmentVariables:
+          - Name: AWS_DEFAULT_REGION
+            Value: !Ref AWS::Region
+          - Name: ELB_NAME
+            Value: ProjectALB
+          - Name: assume_role_arn
+            Value: !Sub arn:${AWS::Partition}:iam::${pDevAccountId}:role/CrossAccount
+      Name: !Sub ${AWS::StackName}-discoveryproject-${pDevAccountId}
+      ServiceRole:
+        Fn::ImportValue:
+          !Sub "${pSourcesStackName}-rCodeBuildRoleArn"
+      Tags:
+        - Key: Project
+          Value: DiscoveryDev
+
+  BlueGreenElbDiscoveryStg:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Artifacts:
+        Type: CODEPIPELINE
+      Source:
+        Type: CODEPIPELINE
+        BuildSpec: |
+          version: 0.2
+          phases:
+            install:
+              commands:
+                - apt-get update -y
+                - pip install --upgrade awscli
+                - pip install --upgrade boto3
+                - apt-get install -y jq
+            pre_build:
+              commands:
+                - aws sts get-caller-identity
+                - TEMP_ROLE=`aws sts assume-role --role-arn ${assume_role_arn} --role-session-name test --region ${AWS_DEFAULT_REGION} --endpoint-url https://sts.${AWS_DEFAULT_REGION}.amazonaws.com`
+                - export TEMP_ROLE
+                - echo $TEMP_ROLE
+                - aws sts get-caller-identity
+                - export AWS_ACCESS_KEY_ID_Target=$(echo "${TEMP_ROLE}" | jq -r '.Credentials.AccessKeyId')
+                - export AWS_SECRET_ACCESS_KEY_Target=$(echo "${TEMP_ROLE}" | jq -r '.Credentials.SecretAccessKey')
+                - export AWS_SESSION_TOKEN_Target=$(echo "${TEMP_ROLE}" | jq -r '.Credentials.SessionToken')
+                - pip install awscli --upgrade --user
+                - echo `aws --version`
+                - ls -ld $(find .)
+                - python deployer.py
+          artifacts:
+            files: cf_inputs.json
+            discard-paths: yes
+      Environment:
+        ComputeType: "BUILD_GENERAL1_SMALL"
+        Image: aws/codebuild/python:3.6.5
+        Type: "LINUX_CONTAINER"
+        EnvironmentVariables:
+          - Name: AWS_DEFAULT_REGION
+            Value: !Ref AWS::Region
+          - Name: ELB_NAME
+            Value: ProjectALB
+          - Name: assume_role_arn
+            Value: !Sub arn:${AWS::Partition}:iam::${pStgAccountId}:role/CrossAccount
+      Name: !Sub ${AWS::StackName}-discoveryproject-${pStgAccountId}
+      ServiceRole:
+        Fn::ImportValue:
+          !Sub "${pSourcesStackName}-rCodeBuildRoleArn"
+      Tags:
+        - Key: Project
+          Value: DiscoveryStg
+  
+  BlueGreenElbDiscoveryProd:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Artifacts:
+        Type: CODEPIPELINE
+      Source:
+        Type: CODEPIPELINE
+        BuildSpec: |
+          version: 0.2
+          phases:
+            install:
+              commands:
+                - apt-get update -y
+                - pip install --upgrade awscli
+                - pip install --upgrade boto3
+                - apt-get install -y jq
+            pre_build:
+              commands:
+                - aws sts get-caller-identity
+                - TEMP_ROLE=`aws sts assume-role --role-arn ${assume_role_arn} --role-session-name test --region ${AWS_DEFAULT_REGION} --endpoint-url https://sts.${AWS_DEFAULT_REGION}.amazonaws.com`
+                - export TEMP_ROLE
+                - echo $TEMP_ROLE
+                - aws sts get-caller-identity
+                - export AWS_ACCESS_KEY_ID_Target=$(echo "${TEMP_ROLE}" | jq -r '.Credentials.AccessKeyId')
+                - export AWS_SECRET_ACCESS_KEY_Target=$(echo "${TEMP_ROLE}" | jq -r '.Credentials.SecretAccessKey')
+                - export AWS_SESSION_TOKEN_Target=$(echo "${TEMP_ROLE}" | jq -r '.Credentials.SessionToken')
+                - pip install awscli --upgrade --user
+                - echo `aws --version`
+                - ls -ld $(find .)
+                - python deployer.py
+          artifacts:
+            files: cf_inputs.json
+            discard-paths: yes
+      Environment:
+        ComputeType: "BUILD_GENERAL1_SMALL"
+        Image: aws/codebuild/python:3.6.5
+        Type: "LINUX_CONTAINER"
+        EnvironmentVariables:
+          - Name: AWS_DEFAULT_REGION
+            Value: !Ref AWS::Region
+          - Name: ELB_NAME
+            Value: ProjectALB
+          - Name: assume_role_arn
+            Value: !Sub arn:${AWS::Partition}:iam::${pProdAccountId}:role/CrossAccount
+      Name: !Sub ${AWS::StackName}-discoveryproject-${pProdAccountId}
+      ServiceRole:
+        Fn::ImportValue:
+          !Sub "${pSourcesStackName}-rCodeBuildRoleArn"
+      Tags:
+        - Key: Project
+          Value: DiscoveryProd
+
+
+  rAppImageCodeBuildProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Artifacts:
+        Type: CODEPIPELINE
+      EncryptionKey:
+        Fn::ImportValue:
+              !Sub "${pSourcesStackName}-rKMSCodePipelineKeyId"
+      Environment:
+        ComputeType: "BUILD_GENERAL1_SMALL"
+        Image: "aws/codebuild/standard:5.0"
+        Type: "LINUX_CONTAINER"
+        EnvironmentVariables:
+          - Name: AWS_DEFAULT_REGION
+            Value: !Ref AWS::Region
+          - Name: REPOSITORY_URI
+            Value: !Sub ${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${pECRRepoApp}
+          - Name: DOCKERHUB_USERNAME
+            Value: !Ref pDockerHubUserName
+          - Name: DOCKERHUB_PASSWORD
+            Value: !Sub 
+            - '{{resolve:secretsmanager:${EnvName}:SecretString:password}}'
+            - { EnvName: !Ref "pDockerHubSecret" }
+        PrivilegedMode: true
+      Name: AppImageBuild
+      ServiceRole:
+        Fn::ImportValue:
+          !Sub "${pSourcesStackName}-rCodeBuildRoleArn"
+      Source:
+        Type: CODEPIPELINE
+        BuildSpec: |
+          version: 0.2
+          phases:
+            install:
+              commands:
+                - apt-get update 
+                - apt-get -y install python3-pip
+                - pip3 install --upgrade awscli
+            pre_build:
+              commands:
+                 - printenv
+                 - echo -n "$CODEBUILD_LOG_PATH" > /tmp/build_id.out
+                 - printf "%s:%s" "$REPOSITORY_URI" "$(cat /tmp/build_id.out)" > /tmp/build_tag.out
+                 - printf '{"tag":"%s"}' "$(cat /tmp/build_id.out)" > /tmp/build.json
+                 - cat /tmp/build.json
+            build:
+              commands:
+                 - docker login -u "$DOCKERHUB_USERNAME" -p "$DOCKERHUB_PASSWORD"
+                 - docker build -f Dockerfile-app --tag "$(cat /tmp/build_tag.out)" .
+            post_build:
+              commands:
+                 - $(aws ecr get-login --no-include-email)
+                 - docker push "$(cat /tmp/build_tag.out)"
+          artifacts:
+            files: /tmp/build.json
+            discard-paths: yes
+      Tags:
+        - Key: Project
+          Value: AppImage
+
+  
+#Lambda
+  rBlueGreenFlipLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      Code:
+        S3Bucket:
+          Fn::ImportValue:
+            !Sub "${pSourcesStackName}-rS3SourceBucket"
+        S3Key: scripts.zip
+      Description: lambda-blue-green
+      FunctionName: lambda-blue-green
+      Handler: lambda-blue-green.handler
+      MemorySize: 256
+      Role:
+        Fn::ImportValue:
+          !Sub "${pSourcesStackName}-rBlueGreenFlipTargetExecutionLambdaRoleArn"
+      Runtime: python3.6
+      Tags:
+        - Key: Lambda
+          Value: blue_green
+      Timeout: 60
+  

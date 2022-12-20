@@ -1,0 +1,659 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: Deploys sources resources for the use of CodePipeline in the tool account
+
+Metadata:
+  AWS::CloudFormation::Interface: 
+    ParameterGroups:
+      -
+        Label: 
+          default: "CodeCommit Repositories"
+        Parameters: 
+          - pCodeCommitRepoName
+      -
+        Label: 
+          default: "ECR Repositories"
+        Parameters: 
+          - pECRRepoNameApp
+      -    
+        Label: 
+          default: "Accounts"
+        Parameters: 
+          - pDevAccountId
+          - pStgAccountId
+          - pProdAccountId
+      -    
+        Label: 
+          default: "SNS topic"
+        Parameters: 
+          - pEmail
+
+
+Parameters:
+
+  pCodeCommitRepoName:
+    Type: String
+    AllowedPattern: ^[a-zA-Z0-9\-\_]{3,100}$
+    Description: CodeComit repository name
+
+  pECRRepoNameApp:
+    AllowedPattern: '(?:[a-z0-9]+(?:[._-][a-z0-9]+)*/)*[a-z0-9]+(?:[._-][a-z0-9]+)*'
+    Type: String
+    Description: ECR repository name
+
+  pDevAccountId:
+    Type: String
+    AllowedPattern: '^\d{12}$'
+    Description: Dev account id
+  pStgAccountId:
+    Type: String
+    AllowedPattern: '^\d{12}$'
+    Description: Stg account id
+  pProdAccountId:
+    Type: String
+    AllowedPattern: '^\d{12}$'
+    Description: Production account id
+
+  pEmail:
+    Type: String
+    AllowedPattern: "^[\\x20-\\x45]?[\\w-\\+]+(\\.[\\w]+)*@[\\w-]+(\\.[\\w]+)*(\\.[a-z]{2,})$"
+    Description: Approval notification email
+
+
+
+Resources:
+
+#Repos
+
+  rCodeCommitApp:
+    Type: AWS::CodeCommit::Repository
+    DeletionPolicy: Delete
+    Properties:
+      RepositoryDescription: Git Repository
+      RepositoryName: !Ref pCodeCommitRepoName
+
+  rCodeCommitIAMGroup:
+    Type: AWS::IAM::Group
+    Properties: 
+      GroupName: Devs
+      Path: /
+      Policies: 
+        - PolicyName: root
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Action:
+                  - codecommit:GitPush
+                  - codecommit:GitPull
+                  - codecommit:CreateBranch
+                  - codecommit:GetBranch
+                  - codecommit:ListBranches
+                Effect: Allow
+                Resource: !Sub '${rCodeCommitApp.Arn}'
+
+  rECRRepoApp:
+    Type: AWS::ECR::Repository
+    Properties:
+      EncryptionConfiguration:
+        EncryptionType: KMS
+        KmsKey: !Ref rKMSCodePipelineKey 
+      RepositoryName: !Ref pECRRepoNameApp
+      RepositoryPolicyText:
+        Version: "2012-10-17"
+        Statement:
+          -
+            Sid: AllowedActions
+            Effect: Allow
+            Principal: 
+               AWS: 
+                - !Sub arn:${AWS::Partition}:iam::${AWS::AccountId}:root
+                - !Sub arn:${AWS::Partition}:iam::${pDevAccountId}:role/ExecutionRole
+                - !Sub arn:${AWS::Partition}:iam::${pStgAccountId}:role/ExecutionRole
+                - !Sub arn:${AWS::Partition}:iam::${pProdAccountId}:role/ExecutionRole
+            Action:
+              - ecr:BatchCheckLayerAvailability
+              - ecr:BatchGetImage
+              - ecr:CompleteLayerUpload
+              - ecr:GetAuthorizationToken
+              - ecr:GetDownloadUrlForLayer
+              - ecr:InitiateLayerUpload
+              - ecr:PutImage
+              - ecr:UploadLayerPart
+      Tags: 
+        - Key: "Name"
+          Value: "App Repo"
+
+
+#S3 buckets
+
+  rS3ArtifactBucket:
+    Type: 'AWS::S3::Bucket'
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: 'aws:kms'
+              KMSMasterKeyID: !Sub '${rKMSCodePipelineKey.Arn}'
+      BucketName: !Sub '${AWS::AccountId}-artifact-bucket'
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      Tags: 
+        - Key: "Name"
+          Value: "Artifact Bucket"
+      VersioningConfiguration:
+        Status: Enabled
+
+  rS3ArtifactBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref rS3ArtifactBucket
+      PolicyDocument:
+        Statement:
+          - Sid: DenyInsecureConnections
+            Effect: Deny
+            Principal: "*"
+            Action: s3:*
+            Resource:
+              - !Sub arn:${AWS::Partition}:s3:::${rS3ArtifactBucket}/*
+            Condition:
+              Bool:
+                aws:SecureTransport: false
+          -
+            Action:
+              - s3:ListBucket
+            Effect: Allow
+            Resource:
+              - !Sub arn:${AWS::Partition}:s3:::${rS3ArtifactBucket}
+            Principal:
+              AWS: 
+                - !Sub arn:${AWS::Partition}:iam::${AWS::AccountId}:root 
+                - !Sub arn:${AWS::Partition}:iam::${pDevAccountId}:role/CrossAccount
+                - !Sub arn:${AWS::Partition}:iam::${pStgAccountId}:role/CrossAccount
+                - !Sub arn:${AWS::Partition}:iam::${pProdAccountId}:role/CrossAccount             
+                - !Sub '${rCodePipelineRole.Arn}'  
+          -
+            Action:
+              - s3:Get*
+              - s3:PutObject
+            Effect: Allow
+            Resource:
+              - !Sub arn:${AWS::Partition}:s3:::${rS3ArtifactBucket}/*
+            Principal:
+              AWS: 
+                - !Sub arn:${AWS::Partition}:iam::${AWS::AccountId}:root 
+                - !Sub arn:${AWS::Partition}:iam::${pDevAccountId}:role/CrossAccount
+                - !Sub arn:${AWS::Partition}:iam::${pStgAccountId}:role/CrossAccount
+                - !Sub arn:${AWS::Partition}:iam::${pProdAccountId}:role/CrossAccount          
+                - !Sub '${rCodePipelineRole.Arn}'  
+  
+  
+  rS3SourceBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: 'aws:kms'
+              KMSMasterKeyID: !Sub '${rKMSCodePipelineKey.Arn}'
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketName: ferpablo-template
+      Tags: 
+        - Key: "Name"
+          Value: "Source Bucket"
+      VersioningConfiguration:
+        Status: Enabled
+    
+  rS3BucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref rS3SourceBucket
+      PolicyDocument:
+        Statement:
+          - Sid: DenyUnEncryptedObjectUploads
+            Effect: Deny
+            Principal: "*"
+            Action: 
+              - s3:PutObject
+            Resource:
+              - !Sub arn:${AWS::Partition}:s3:::${rS3SourceBucket}/*
+            Condition:
+              StringNotEquals:
+                s3:x-amz-server-side-encryption: aws:kms
+          - Sid: DenyInsecureConnections
+            Effect: Deny
+            Principal: "*"
+            Action: s3:*
+            Resource:
+              - !Sub arn:${AWS::Partition}:s3:::${rS3SourceBucket}/*
+            Condition:
+              Bool:
+                aws:SecureTransport: false
+          - 
+            Action: 
+              - s3:List*
+              - s3:Get*
+            Effect: Allow
+            Resource:
+              - !Sub arn:${AWS::Partition}:s3:::${rS3SourceBucket}
+            Principal:
+              AWS:
+                - !Sub arn:${AWS::Partition}:iam::${AWS::AccountId}:root
+                - !Sub arn:${AWS::Partition}:iam::${pDevAccountId}:role/CFNRole
+                - !Sub arn:${AWS::Partition}:iam::${pStgAccountId}:role/CFNRole
+                - !Sub arn:${AWS::Partition}:iam::${pProdAccountId}:role/CFNRole  
+                - !Sub '${rCodePipelineRole.Arn}'
+          - 
+            Action: 
+              - s3:Get*
+              - s3:PutObject
+            Effect: Allow
+            Resource:
+              - !Sub arn:${AWS::Partition}:s3:::${rS3SourceBucket}/*
+            Principal:
+              AWS:
+                - !Sub arn:${AWS::Partition}:iam::${pDevAccountId}:role/CFNRole
+                - !Sub arn:${AWS::Partition}:iam::${pStgAccountId}:role/CFNRole
+                - !Sub arn:${AWS::Partition}:iam::${pProdAccountId}:role/CFNRole  
+                - !Sub '${rCodePipelineRole.Arn}'
+           
+
+#KMS Key for encrypting all elements
+
+  rKMSCodePipelineKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: Used by Assumed Roles in Dev/Stg/Prod accounts to Encrypt/Decrypt code
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: "2012-10-17"
+        Id: !Ref AWS::StackName
+        Statement:
+          -
+            Sid: Allows admin of the key
+            Effect: Allow
+            Principal:
+              AWS: !Sub arn:${AWS::Partition}:iam::${AWS::AccountId}:root
+            Action:
+              - "kms:*"
+            Resource: "*"
+          -
+            Sid: Allow use of the key from the other accounts
+            Effect: Allow
+            Principal:
+              AWS:
+                - !Sub arn:${AWS::Partition}:iam::${pDevAccountId}:role/ExecutionRole
+                - !Sub arn:${AWS::Partition}:iam::${pStgAccountId}:role/ExecutionRole
+                - !Sub arn:${AWS::Partition}:iam::${pProdAccountId}:role/ExecutionRole
+                - !Sub arn:${AWS::Partition}:iam::${pDevAccountId}:role/CFNRole
+                - !Sub arn:${AWS::Partition}:iam::${pStgAccountId}:role/CFNRole
+                - !Sub arn:${AWS::Partition}:iam::${pProdAccountId}:role/CFNRole
+                - !Sub arn:${AWS::Partition}:iam::${pDevAccountId}:role/CrossAccount
+                - !Sub arn:${AWS::Partition}:iam::${pStgAccountId}:role/CrossAccount
+                - !Sub arn:${AWS::Partition}:iam::${pProdAccountId}:role/CrossAccount
+                - !Sub '${rCodePipelineRole.Arn}'            
+            Action:
+              - kms:DescribeKey
+              - kms:GenerateDataKey*
+              - kms:Encrypt
+              - kms:ReEncrypt*
+              - kms:Decrypt
+              - kms:RetireGrant
+              - kms:CreateGrant
+              - kms:RetireGrant
+              - kms:DescribeKey
+            Resource: "*"
+      Tags: 
+        - Key: "Name"
+          Value: "CMK"
+  
+  rKMSCodePipelineAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: !Sub alias/codepipeline-crossaccounts
+      TargetKeyId: !Ref rKMSCodePipelineKey
+  
+
+#SNS
+
+  rSNSTopic: 
+    Type: AWS::SNS::Topic
+    Properties:
+      KmsMasterKeyId: !Ref rKMSCodePipelineKey
+      Tags: 
+        - Key: "Name"
+          Value: "SNS Topic for the CodePipeline approval actions"
+
+  rSnsLambdaSubscription:
+    Type: 'AWS::SNS::Subscription'
+    Properties:
+      TopicArn: !Ref 'rSNSTopic'
+      Protocol: email
+      Endpoint: !Ref pEmail
+
+#Roles and policies needed by the pipeline  
+
+  rCodePipelineRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codepipeline.amazonaws.com
+            Action: 
+              - 'sts:AssumeRole'
+      Path: /
+      Tags:
+        - Key: "Name"
+          Value: "CodePipeline Role"
+      
+  rCodePipelinePolicy:
+    Type: AWS::IAM::Policy
+    DependsOn: 
+      - rS3ArtifactBucketPolicy
+      - rKMSCodePipelineKey
+      - rS3SourceBucket
+    Properties:
+      PolicyName: codepipeline-policy
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          -
+            Effect: Allow
+            Action:
+              - codecommit:GetRepository
+              - codecommit:List*
+              - codecommit:Get*
+              - codecommit:GitPull
+              - codecommit:UploadArchive
+              - codecommit:CancelUploadArchive
+              - codebuild:BatchGetBuilds
+              - codebuild:StartBuild
+              - cloudformation:CreateStack
+              - cloudformation:DeleteStack
+              - cloudformation:DescribeStacks
+              - cloudformation:UpdateStack
+              - cloudformation:CreateChangeSet
+              - cloudformation:DeleteChangeSet
+              - cloudformation:DescribeChangeSet
+              - cloudformation:ExecuteChangeSet
+              - cloudformation:SetStackPolicy
+              - cloudformation:ValidateTemplate
+              - iam:ListRoles
+              - iam:PassRole
+              - sns:Publish
+              - lambda:InvokeFunction
+              - lambda:ListFunctions
+            Resource:
+              - "*"
+          -
+            Effect: Allow
+            Action:
+              - kms:DescribeKey
+              - kms:GenerateDataKey*
+              - kms:Encrypt
+              - kms:ReEncrypt*
+              - kms:Decrypt
+            Resource: !Sub ${rKMSCodePipelineKey.Arn}
+          -
+            Effect: Allow
+            Action:
+              - s3:ListBucket
+              - s3:Get*
+            Resource:
+              - !Sub arn:${AWS::Partition}:s3:::${rS3ArtifactBucket}
+              - !Sub arn:${AWS::Partition}:s3:::${rS3SourceBucket}
+          -
+            Effect: Allow
+            Action:
+              - s3:PutObject
+              - s3:Get*
+            Resource:
+              - !Sub arn:${AWS::Partition}:s3:::${rS3ArtifactBucket}/*
+              - !Sub arn:${AWS::Partition}:s3:::${rS3SourceBucket}/*
+          -
+            Effect: Allow
+            Action:
+              - sts:AssumeRole
+            Resource:
+              - !Sub arn:${AWS::Partition}:iam::${pDevAccountId}:role/CrossAccount
+              - !Sub arn:${AWS::Partition}:iam::${pStgAccountId}:role/CrossAccount
+              - !Sub arn:${AWS::Partition}:iam::${pProdAccountId}:role/CrossAccount
+
+      Roles:
+        -
+          !Ref rCodePipelineRole
+     
+
+  rCodeBuildPolicy:
+    Type: AWS::IAM::Policy
+    DependsOn: 
+      - rS3ArtifactBucketPolicy
+      - rS3ArtifactBucket
+      - rECRRepoApp
+    Properties:
+      PolicyName: CodeBuild-policy
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Action:
+              - logs:CreateLogGroup
+              - logs:CreateLogStream
+              - logs:PutLogEvents
+            Resource: !Sub arn:aws:logs:*:*:*
+          - Effect: Allow
+            Action:
+              - s3:Get*
+              - s3:PutObject
+              - s3:ListBucket
+            Resource:
+             - !Sub 'arn:${AWS::Partition}:s3:::${rS3ArtifactBucket}/*'
+             - !Sub 'arn:${AWS::Partition}:s3:::${rS3ArtifactBucket}'
+          - Effect: Allow
+            Action:
+              - ec2:DescribeTags
+              - ec2:CreateTags
+              - ec2:DeleteTags
+              - cloudformation:Describe*
+              - cloudFormation:List*
+              - iam:PassRole
+              - s3:ListAllMyBuckets
+              - s3:GetBucketLocation
+              - elasticloadbalancing:*
+            Resource:
+              - "*"
+          - Effect: Allow
+            Action:
+              - kms:DescribeKey
+              - kms:GenerateDataKey*
+              - kms:Encrypt
+              - kms:ReEncrypt*
+              - kms:Decrypt
+            Resource: !Sub ${rKMSCodePipelineKey.Arn}
+          - Effect: Allow
+            Action: 
+              - ecr:BatchCheckLayerAvailability
+              - ecr:BatchGetImage
+              - ecr:CompleteLayerUpload
+              - ecr:GetDownloadUrlForLayer
+              - ecr:PutImage
+              - ecr:UploadLayerPart
+              - ecr:InitiateLayerUpload
+
+            Resource: 
+              - !Sub arn:${AWS::Partition}:ecr:${AWS::Region}:${AWS::AccountId}:repository/${rECRRepoApp}
+
+          - Effect: Allow
+            Action:
+              - sts:AssumeRole
+            Resource:
+              - !Sub arn:${AWS::Partition}:iam::${pDevAccountId}:role/CrossAccount
+              - !Sub arn:${AWS::Partition}:iam::${pStgAccountId}:role/CrossAccount
+              - !Sub arn:${AWS::Partition}:iam::${pProdAccountId}:role/CrossAccount
+
+
+      Roles:
+        - !Ref rCodeBuildRole
+  
+  rCodeBuildRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: CodeBuildRole
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - codebuild.amazonaws.com
+            Action: 
+              - 'sts:AssumeRole'
+      Path: /
+      Policies:
+        - PolicyName: root
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Action:
+                  - codebuild:*
+                  - codepipeline:*
+                  - ecr:GetAuthorizationToken
+                  - ecr:InitiateLayerUpload
+                Effect: Allow
+                Resource: "*"
+      Tags: 
+        - Key: "Name"
+          Value: "CodeBuild Role"
+
+  rBlueGreenFlipTargetExecutionLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: lambda-blue-green-swap-role
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          -
+            Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com  
+            Action:
+                - sts:AssumeRole
+      Path: /
+      Tags: 
+        - Key: "Name"
+          Value: "Lambda Role"
+
+  rBlueGreenFlipLambdaPolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: lambda-blue-green-swap-policy
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+        - Effect: Allow
+          Action: sts:AssumeRole
+          Resource:
+           - !Sub arn:${AWS::Partition}:iam::${pDevAccountId}:role/rCrossLambdaRole
+           - !Sub arn:${AWS::Partition}:iam::${pStgAccountId}:role/rCrossLambdaRole
+           - !Sub arn:${AWS::Partition}:iam::${pProdAccountId}:role/rCrossLambdaRole
+        - Effect: Allow
+          Action: 
+          - elasticloadbalancing:*
+          - codepipeline:PutJobFailureResult
+          - codepipeline:PutJobSuccessResult
+          Resource: "*"
+        - Effect: Allow
+          Action:
+          - logs:CreateLogGroup
+          - logs:CreateLogStream
+          - logs:PutLogEvents
+          Resource: arn:aws:logs:*:*:*
+      Roles:
+        - !Ref rBlueGreenFlipTargetExecutionLambdaRole
+
+
+Outputs:
+  oCodeCommitRepoAppName:
+    Description: Codecommit app repo name
+    Export:
+      Name: !Sub "${AWS::StackName}-CodeCommitAppRepoName"
+    Value: !Sub "${rCodeCommitApp.Name}" 
+  oECRRepoApp:
+    Description: ECR repo for app
+    Export:
+      Name: !Sub "${AWS::StackName}-rECRRepoApp"
+    Value: !Ref rECRRepoApp
+  oECRRepoAppArn:
+    Description: ECR repo Arn for app
+    Export:
+      Name: !Sub "${AWS::StackName}-rECRRepoAppArn"
+    Value: !Sub "${rECRRepoApp.Arn}"
+  oS3ArtifactBucket:
+    Description: Artifact bucket
+    Export:
+      Name: !Sub "${AWS::StackName}-rS3ArtifactBucket"
+    Value: !Ref rS3ArtifactBucket
+  oS3SourceBucket:
+    Description: Source bucket
+    Export:
+      Name: !Sub "${AWS::StackName}-rS3SourceBucket"
+    Value: !Ref rS3SourceBucket
+  oKMSCodePipelineKeyArn:
+    Description: CodePipeline KMS Key Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-rKMSCodePipelineKeyArn"
+    Value: !Sub '${rKMSCodePipelineKey.Arn}'
+  oKMSCodePipelineKeyId:
+    Description: CodePipeline KMS Key Id
+    Export:
+      Name: !Sub "${AWS::StackName}-rKMSCodePipelineKeyId"
+    Value: !Ref rKMSCodePipelineKey
+  oSNSTopic:
+    Description: SNS topic for approvals
+    Export:
+      Name: !Sub "${AWS::StackName}-rSNSTopic"
+    Value: !Ref rSNSTopic
+  oCodePipelineRole:
+    Description: CodePipeline Role
+    Export:
+      Name: !Sub "${AWS::StackName}-rCodePipelineRole"
+    Value: !Ref rCodePipelineRole
+  oCodePipelineRoleArn:
+    Description: CodePipeline Role Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-rCodePipelineRoleArn"
+    Value: !Sub "${rCodePipelineRole.Arn}"
+  oCodeBuildRole:
+    Description: CodeBuild Role
+    Export:
+      Name: !Sub "${AWS::StackName}-rCodeBuildRole"
+    Value: !Ref rCodeBuildRole
+  oCodeBuildRoleArn:
+    Description: CodeBuild Role Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-rCodeBuildRoleArn"
+    Value: !Sub "${rCodeBuildRole.Arn}"
+  oLambdaRole:
+    Description: Lambda Role
+    Export:
+      Name: !Sub "${AWS::StackName}-rBlueGreenFlipTargetExecutionLambdaRole"
+    Value: !Ref rBlueGreenFlipTargetExecutionLambdaRole
+  oLambdaRoleArn:
+    Description: Lambda Role Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-rBlueGreenFlipTargetExecutionLambdaRoleArn"
+    Value: !Sub "${rBlueGreenFlipTargetExecutionLambdaRole.Arn}"
+
+
+    
+

@@ -1,0 +1,98 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: Deploy Autoscaling for Fargte
+Metadata: 
+  AWS::CloudFormation::Interface: 
+    ParameterGroups: 
+      - Label: 
+          default: "Fargate values"
+        Parameters: 
+          - pClusterName
+          - pServiceName1
+          - pServiceName2
+
+      - Label:
+          default: "Autoscaling values"
+        Parameters:
+         - MinContainers
+         - MaxContainers
+         - rAutoScalingTargetValue
+
+
+
+
+Parameters:
+  pClusterName:
+    Type: String
+  pServiceName1:
+    Type: String
+  pServiceName2:
+    Type: String
+
+  
+  MinContainers:
+    Type: Number
+    Default: 1
+  MaxContainers:
+    Type: Number
+    Default: 10
+  rAutoScalingTargetValue:
+    Type: Number
+    Default: 50
+
+
+Resources:
+  rAutoScalingRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: AB3AutoScalingRole
+      AssumeRolePolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/service-role/AmazonEC2ContainerServiceAutoscaleRole'
+
+  rAutoScalingTarget:
+    Type: AWS::ApplicationAutoScaling::ScalableTarget
+    Properties:
+      MinCapacity: !Ref MinContainers
+      MaxCapacity: !Ref MaxContainers
+      ResourceId: !Sub service/${pClusterName}/${pServiceName1}
+      ScalableDimension: ecs:service:DesiredCount
+      ServiceNamespace: ecs
+      RoleARN: !Sub ${rAutoScalingRole.Arn}
+  rAutoScalingPolicy:
+    Type: AWS::ApplicationAutoScaling::ScalingPolicy
+    Properties:
+      PolicyName: !Sub ${pServiceName1}-rAutoScalingPolicy
+      PolicyType: TargetTrackingScaling
+      ScalingTargetId: !Ref rAutoScalingTarget
+      TargetTrackingScalingPolicyConfiguration:
+        PredefinedMetricSpecification:
+          PredefinedMetricType: ECSServiceAverageCPUUtilization
+        ScaleInCooldown: 10
+        ScaleOutCooldown: 10
+        TargetValue: !Ref rAutoScalingTargetValue
+  rAutoScalingTarget2:
+    Type: AWS::ApplicationAutoScaling::ScalableTarget
+    Properties:
+      MinCapacity: !Ref MinContainers
+      MaxCapacity: !Ref MaxContainers
+      ResourceId: !Sub service/${pClusterName}/${pServiceName2}
+      ScalableDimension: ecs:service:DesiredCount
+      ServiceNamespace: ecs
+      RoleARN: !Sub ${rAutoScalingRole.Arn}
+  rAutoScalingPolicy2:
+    Type: AWS::ApplicationAutoScaling::ScalingPolicy
+    Properties:
+      PolicyName: !Sub ${pServiceName2}-AutoScalingPolicy
+      PolicyType: TargetTrackingScaling
+      ScalingTargetId: !Ref rAutoScalingTarget2
+      TargetTrackingScalingPolicyConfiguration:
+        PredefinedMetricSpecification:
+          PredefinedMetricType: ECSServiceAverageCPUUtilization
+        ScaleInCooldown: 10
+        ScaleOutCooldown: 10
+        TargetValue: !Ref rAutoScalingTargetValue

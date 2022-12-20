@@ -1,0 +1,597 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: Deploy VPC resources and network configurations on target accounts, this is dev, stg and prod.
+
+Parameters:
+  
+  pVPCidrBlock:
+    Type: String
+    AllowedPattern: '((\d{1,3})\.){3}\d{1,3}/\d{1,2}'
+    ConstraintDescription: This parameter only accepts an IPv4 CIDR block
+    Default: "10.0.0.0/20"
+    Description: CidrBlock for the VPC
+
+  pDBPrivateSubnet1CidrBlock:
+    Type: String
+    AllowedPattern: '((\d{1,3})\.){3}\d{1,3}/\d{1,2}'
+    ConstraintDescription: This parameter only accepts an IPv4 CIDR block
+    Default: "10.0.5.0/24"
+    Description: CidrBlock for first Fargate private subnet
+  pDBPrivateSubnet2CidrBlock:
+    Type: String
+    AllowedPattern: '((\d{1,3})\.){3}\d{1,3}/\d{1,2}'
+    ConstraintDescription: This parameter only accepts an IPv4 CIDR block
+    Default: "10.0.6.0/24"
+    Description: CidrBlock for second Fargate private subnet
+
+  pFargatePrivateSubnet1CidrBlock:
+    Type: String
+    AllowedPattern: '((\d{1,3})\.){3}\d{1,3}/\d{1,2}'
+    ConstraintDescription: This parameter only accepts an IPv4 CIDR block
+    Default: "10.0.3.0/24"
+    Description: CidrBlock for first Fargate private subnet
+  pFargatePrivateSubnet2CidrBlock:
+    Type: String
+    AllowedPattern: '((\d{1,3})\.){3}\d{1,3}/\d{1,2}'
+    ConstraintDescription: This parameter only accepts an IPv4 CIDR block
+    Default: "10.0.4.0/24"
+    Description: CidrBlock for second Fargate private subnet
+
+  pPublicSubnet1CidrBlock:
+    Type: String
+    AllowedPattern: '((\d{1,3})\.){3}\d{1,3}/\d{1,2}'
+    ConstraintDescription: This parameter only accepts an IPv4 CIDR block
+    Default: 10.0.1.0/24
+    Description: CidrBlock for first public subnet
+  pPublicSubnet2CidrBlock:
+    Type: String
+    AllowedPattern: '((\d{1,3})\.){3}\d{1,3}/\d{1,2}'
+    ConstraintDescription: This parameter only accepts an IPv4 CIDR block
+    Default: 10.0.2.0/24
+    Description: CidrBlock for first public subnet
+
+
+
+Resources:
+
+  rVPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref pVPCidrBlock
+      EnableDnsHostnames: 'true'
+      EnableDnsSupport: 'true'
+      InstanceTenancy: default
+      Tags:
+       - Key: Name
+         Value: VPC
+
+  rInternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: VPC-IGW
+
+  InternetGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      InternetGatewayId: !Ref rInternetGateway
+      VpcId: !Ref rVPC
+    
+
+
+#DB
+
+  rDBPrivateSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      AvailabilityZone: !Select 
+      - 0
+      - Fn::GetAZs: !Ref 'AWS::Region'
+      CidrBlock: !Ref pDBPrivateSubnet1CidrBlock
+      Tags:
+      - Key: Name
+        Value: DB-Private-Subnet-1
+      VpcId: !Ref rVPC
+
+  rPrivateDBRouteTable1:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      Tags:
+      - Key: Name
+        Value: Private-DB-RouteTable-1
+      VpcId: !Ref rVPC
+
+  rSubnetPrivateDBRouteTableAssociation1:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref rPrivateDBRouteTable1
+      SubnetId: !Ref rDBPrivateSubnet1
+
+  rDBPrivateSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      AvailabilityZone: !Select 
+      - 1
+      - Fn::GetAZs: !Ref 'AWS::Region'
+      CidrBlock: !Ref pDBPrivateSubnet2CidrBlock
+      Tags:
+      - Key: Name
+        Value: DB-Private-Subnet-2
+      VpcId: !Ref rVPC
+
+  rPrivateDBRouteTable2:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      Tags:
+      - Key: Name
+        Value: Private-DB-RouteTable-2
+      VpcId: !Ref rVPC
+
+  rSubnetPrivateDBRouteTableAssociation2:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref rPrivateDBRouteTable2
+      SubnetId: !Ref rDBPrivateSubnet2
+
+  
+
+#Fargate
+
+  rFargatePrivateSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      AvailabilityZone: !Select 
+      - 0
+      - Fn::GetAZs: !Ref 'AWS::Region'
+      CidrBlock: !Ref pFargatePrivateSubnet1CidrBlock      
+      Tags:
+      - Key: Name
+        Value: Fargate-Private-Subnet-1 
+      VpcId: !Ref rVPC
+
+  rPrivateFargateRouteTable1:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      Tags:
+      - Key: Name
+        Value: Fargate-Private-RouteTable-1
+      VpcId: !Ref rVPC
+
+  rSubnetPrivateFargateRouteTableAssociation1:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref rPrivateFargateRouteTable1
+      SubnetId: !Ref rFargatePrivateSubnet1
+
+  rPrivateFargateRoute1:
+    Type: AWS::EC2::Route
+    Properties:
+       DestinationCidrBlock: 0.0.0.0/0
+       NatGatewayId: !Ref rNatGW1
+       RouteTableId: !Ref rPrivateFargateRouteTable1
+
+  rPrivateFargateRoute2:
+    Type: AWS::EC2::Route
+    Properties:
+       DestinationCidrBlock: 0.0.0.0/0
+       NatGatewayId: !Ref rNatGW2
+       RouteTableId: !Ref rPrivateFargateRouteTable2
+  
+  rFargatePrivateSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      AvailabilityZone: !Select 
+      - 1
+      - Fn::GetAZs: !Ref 'AWS::Region'
+      CidrBlock: !Ref pFargatePrivateSubnet2CidrBlock
+      Tags:
+      - Key: Name
+        Value: Fargate-Private-Subnet-2 
+      VpcId: !Ref rVPC 
+        
+  rPrivateFargateRouteTable2:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      Tags:
+      - Key: Name
+        Value: Fargate-Private-RouteTable-2
+      VpcId: !Ref rVPC
+
+  rSubnetPrivateFargateRouteTableAssociation2:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref rPrivateFargateRouteTable2
+      SubnetId: !Ref rFargatePrivateSubnet2
+
+  
+# NAT GATEWAYS 
+
+  rEIP1:
+    Type: AWS::EC2::EIP
+    Properties:
+      Tags:
+        - Key: Name
+          Value: EIP-1
+
+  rNatGW1:
+    Type: AWS::EC2::NatGateway
+    Properties: 
+      AllocationId: !Sub '${rEIP1.AllocationId}'
+      SubnetId: !Ref rPublicSubnet1
+      Tags:
+      - Key: Name
+        Value: Fargate-NATGW-1
+
+  rEIP2:
+    Type: AWS::EC2::EIP
+    Properties:
+      Tags:
+        - Key: Name
+          Value: EIP-2
+
+  rNatGW2:
+    Type: AWS::EC2::NatGateway
+    Properties: 
+      AllocationId: !Sub '${rEIP2.AllocationId}'
+      SubnetId: !Ref rPublicSubnet2
+      Tags:
+      - Key: Name
+        Value: Fargate-NATGW-2
+
+
+
+  
+
+
+#ALB
+  rPublicSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      AvailabilityZone: !Select 
+      - 0
+      - Fn::GetAZs: !Ref 'AWS::Region'
+      CidrBlock: !Ref pPublicSubnet1CidrBlock
+      Tags:
+      - Key: Name
+        Value: Public-Subnet-1
+      VpcId: !Ref rVPC
+      
+      
+  rPublicRoute1:
+    Type: AWS::EC2::Route
+    Properties:
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref rInternetGateway
+      RouteTableId: !Ref rPublicRouteTable1
+
+  rPublicRouteTable1:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      Tags:
+      - Key: Name
+        Value: Public-Route-Table-1
+      VpcId: !Ref rVPC
+
+  rSubnetPublicRouteTableAssociation1:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref rPublicRouteTable1
+      SubnetId: !Ref rPublicSubnet1
+
+
+  rPublicSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      AvailabilityZone: !Select 
+      - 1
+      - Fn::GetAZs: !Ref 'AWS::Region'
+      CidrBlock: !Ref pPublicSubnet2CidrBlock
+      Tags:
+      - Key: Name
+        Value: Public-Subnet-2
+      VpcId: !Ref rVPC
+
+  rPublicRouteTable2:
+    Type: AWS::EC2::RouteTable
+    Properties: 
+      Tags:
+      - Key: Name
+        Value: Public-Route-Table-2
+      VpcId: !Ref rVPC
+
+  rSubnetPublicRouteTableAssociation2:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref rPublicRouteTable2
+      SubnetId: !Ref rPublicSubnet2
+
+  rPublicRoute2:
+    Type: AWS::EC2::Route
+    Properties:
+       DestinationCidrBlock: 0.0.0.0/0
+       GatewayId: !Ref rInternetGateway
+       RouteTableId: !Ref rPublicRouteTable2
+
+#Security Groups
+
+  rAlbSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow http/s to Fargate service 
+      VpcId: !Ref rVPC
+      SecurityGroupIngress:
+      - IpProtocol: tcp
+        FromPort: 80
+        ToPort: 80
+        CidrIp: '0.0.0.0/0' 
+      - IpProtocol: tcp
+        FromPort: 443
+        ToPort: 443
+        CidrIp: '0.0.0.0/0'
+      - IpProtocol: tcp
+        FromPort: 8080
+        ToPort: 8080
+        CidrIp: '0.0.0.0/0' 
+      - IpProtocol: tcp
+        FromPort: 8443
+        ToPort: 8443
+        CidrIp: '0.0.0.0/0'
+      SecurityGroupEgress:
+      - IpProtocol: tcp
+        FromPort: 80     
+        ToPort: 80
+        DestinationSecurityGroupId: !Ref rFargateSecurityGroup
+      - IpProtocol: tcp
+        FromPort: 443     
+        ToPort: 443
+        DestinationSecurityGroupId: !Ref rFargateSecurityGroup
+      Tags:
+      - Key: Name
+        Value: ALB security group
+
+  rFargateSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow http to containers  
+      VpcId: !Ref rVPC
+      SecurityGroupIngress:
+      - IpProtocol: tcp
+        FromPort: 443
+        ToPort: 443
+        CidrIp: !Ref pVPCidrBlock
+      - IpProtocol: tcp
+        FromPort: 80
+        ToPort: 80
+        CidrIp: !Ref pVPCidrBlock
+      SecurityGroupEgress:
+      - IpProtocol: tcp
+        FromPort: 5432
+        ToPort: 5432
+        CidrIp: !Ref pVPCidrBlock
+      - IpProtocol: tcp
+        FromPort: 443
+        ToPort: 443
+        CidrIp: 0.0.0.0/0
+      - IpProtocol: tcp
+        FromPort: 2049
+        ToPort: 2049
+        CidrIp: 0.0.0.0/0
+      Tags:
+      - Key: Name
+        Value: Fargate security group
+
+  rPostGreSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      VpcId: !Ref rVPC
+      GroupDescription: Access database 
+      SecurityGroupIngress:
+      - SourceSecurityGroupId: !Ref rFargateSecurityGroup
+        IpProtocol: tcp
+        FromPort: '5432'
+        ToPort: '5432'
+      Tags:
+      - Key: Name
+        Value: DBInstance Security group
+
+  rMountTargetSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      VpcId: !Ref rVPC
+      GroupDescription: Security group for mount target
+      SecurityGroupIngress:
+      - IpProtocol: tcp
+        FromPort: '2049'
+        ToPort: '2049'
+        CidrIp: !Ref pVPCidrBlock
+
+
+#VPC Endpoints
+
+  rEndpointsSecurityGroup:
+    Type: 'AWS::EC2::SecurityGroup'
+    Properties:
+      GroupDescription: 'Endpoints SecurityGroup'
+      GroupName: !Sub '${AWS::StackName}'
+      VpcId: !Ref rVPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          ToPort: 443
+          FromPort: 443
+          CidrIp: !Ref pVPCidrBlock
+      Tags:
+       - Key: Name
+         Value: Endpoints-SecurityGroup
+
+  rEndpointEFS:
+    Type: AWS::EC2::VPCEndpoint
+    Properties: 
+      PolicyDocument: '{
+        "Version": "2012-10-17",
+        "Statement": [{
+            "Sid": "Restrict Usage to EFS Actions",
+            "Effect": "Allow",
+            "Action": ["elasticfilesystem:ClientMount","elasticfilesystem:ClientWrite"],
+            "Principal": "*",
+            "Resource": "*"
+            }]
+          }'
+      PrivateDnsEnabled: true
+      SecurityGroupIds: 
+        - !Ref rMountTargetSecurityGroup
+        - !Ref rEndpointsSecurityGroup
+
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.elasticfilesystem'
+      SubnetIds: 
+        - !Ref rFargatePrivateSubnet1
+        - !Ref rFargatePrivateSubnet2
+      VpcEndpointType: Interface
+      VpcId: !Ref rVPC
+
+
+  rEndpointSM:
+    Type: 'AWS::EC2::VPCEndpoint'
+    Properties:
+      PolicyDocument: '{
+        "Version": "2012-10-17",
+        "Statement": [{
+            "Sid": "Restrict Usage to get secrets",
+            "Effect": "Allow",
+            "Action": "secretsmanager:GetSecretValue",
+            "Principal": "*",
+            "Resource": "*"
+            }]
+          }'
+      PrivateDnsEnabled: true
+      SecurityGroupIds:
+        - !Ref rEndpointsSecurityGroup
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.secretsmanager'
+      SubnetIds: 
+        - !Ref rFargatePrivateSubnet1
+        - !Ref rFargatePrivateSubnet2
+      VpcEndpointType: Interface
+      VpcId: !Ref rVPC
+
+
+  rEndpointCW:
+    Type: 'AWS::EC2::VPCEndpoint'
+    Properties:
+      PolicyDocument: '{
+        "Version":"2012-10-17",
+        "Statement": [{
+          "Sid": "Restrict Usage to PutMetric Action",
+          "Effect": "Allow",
+          "Principal": "*",
+          "Action": ["cloudwatch:PutMetricData"],
+          "Resource": "*"
+          }]
+      }'
+      PrivateDnsEnabled: true
+      SecurityGroupIds: [!Ref rEndpointsSecurityGroup]
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.monitoring'
+      SubnetIds: 
+        - !Ref rFargatePrivateSubnet1
+        - !Ref rFargatePrivateSubnet2
+      VpcEndpointType: Interface
+      VpcId: !Ref rVPC
+
+  rEndpointCWLogs:
+    Type: 'AWS::EC2::VPCEndpoint'
+    Properties:
+      PolicyDocument: '{
+        "Statement": [{
+          "Sid": "Restrict Usage to CW Logs Put Only",
+          "Principal": "*",
+          "Action": ["logs:CreateLogStream","logs:PutLogEvents"],
+        "Effect": "Allow",
+        "Resource": "*" }]
+        }'
+      PrivateDnsEnabled: true
+      SecurityGroupIds: [!Ref rEndpointsSecurityGroup]
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.logs'
+      SubnetIds: 
+        - !Ref rFargatePrivateSubnet1
+        - !Ref rFargatePrivateSubnet2
+      VpcEndpointType: Interface
+      VpcId: !Ref rVPC
+      
+
+
+Outputs:
+  oVPC:
+    Description: The ID of the VPC
+    Value: !Ref rVPC
+    Export:
+      Name: !Sub "${AWS::StackName}-VPCID"
+
+  oDBPrivateSubnet1:
+    Description: DB Private subnet 1
+    Value: !Ref rDBPrivateSubnet1
+    Export:
+      Name: !Sub "${AWS::StackName}-DBPrivateSubnet1"
+  oDBPrivateSubnet2:
+    Description: DB Private subnet 2
+    Value: !Ref rDBPrivateSubnet2
+    Export:
+      Name: !Sub "${AWS::StackName}-DBPrivateSubnet2"
+
+  oFargatePrivateSubnet1:
+    Description: Fargate Private subnet 1
+    Value: !Ref rFargatePrivateSubnet1
+    Export:
+      Name: !Sub "${AWS::StackName}-FargatePrivateSubnet1"
+  oFargatePrivateSubnet2:
+    Description: Fargate Private subnet 2
+    Value: !Ref rFargatePrivateSubnet2
+    Export:
+      Name: !Sub "${AWS::StackName}-FargatePrivateSubnet2"
+
+  oPublicSubnet1:
+    Description: Public subnet 1
+    Value: !Ref rPublicSubnet1
+    Export:
+      Name: !Sub "${AWS::StackName}-PublicSubnet1"
+  oPublicSubnet2:
+    Description: Public subnet 1
+    Value: !Ref rPublicSubnet2
+    Export:
+      Name: !Sub "${AWS::StackName}-PublicSubnet2"
+
+  oVPCidrBlock:
+    Description: VPC CIDR Block
+    Value: !Ref pVPCidrBlock
+    Export:
+      Name: !Sub "${AWS::StackName}-VPCidrBlock"
+
+  oAlbSecurityGroup:
+    Description: ALB security group
+    Value: !Ref rAlbSecurityGroup
+    Export:
+      Name: !Sub "${AWS::StackName}-AlbSecurityGroup"
+
+  oFargateSecurityGroup:
+    Description: Fargate security group
+    Value: !Ref rFargateSecurityGroup 
+    Export:
+      Name: !Sub "${AWS::StackName}-FargateSecurityGroup"
+
+  oPostGreSecurityGroup:
+    Description: PostGre security group
+    Value: !Ref rPostGreSecurityGroup
+    Export:
+      Name: !Sub "${AWS::StackName}-PostGreSecurityGroup"
+
+  oMountTargetSecurityGroup:
+    Description: MountTarget EFS Security Group 
+    Value: !Ref rPostGreSecurityGroup
+    Export:
+      Name: !Sub "${AWS::StackName}-EFSMountTarget"  
+
+  
+
+  
+
+ 
+
+  
+

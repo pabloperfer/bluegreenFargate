@@ -1,0 +1,222 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: Deploy AWS Service
+Metadata: 
+  AWS::CloudFormation::Interface: 
+    ParameterGroups: 
+      - Label: 
+          default: "Stack Names"
+        Parameters: 
+          - pAlbStackName
+          - pNetworkStackName
+
+      - Label:
+          default: "Tool Account"
+        Parameters:
+         - pToolAccountId
+         - ptoolKMSARN
+
+      - Label:
+          default: "Fargate Cluster"
+        Parameters:
+         - pCode1
+         - pCode2
+         - pRepository
+         - pTemplateBucket
+
+
+Parameters:
+  pAlbStackName:
+    Type: String
+    Description: 'Alb stack Name'
+    Default: ALB-Roles
+  pNetworkStackName:
+    Type: String
+    Description: 'Network stack Name'
+  pToolAccountId:
+    Type: String
+  ptoolKMSARN:
+    Type: String
+    Description: 'CodePipeline Kms'
+
+
+  pCode1:
+    Type: String
+    Description: 'Docker Image Tag'
+    Default: 0154b493-6c14-44bd-a7ae-6a2a17aa8d9d
+  pCode2:
+    Type: String
+    Description: 'Docker Image Tag'
+    Default: cfa23586-c9a5-4d6b-9ce1-30555de794bc
+  pRepository:
+    Type: String
+    Default: project/app
+  pTemplateBucket:
+    Type: String
+    Description: >
+      S3 Bucket used for nested templates
+    Default: ferpablo-template
+
+Mappings:
+   AccountToParams:
+    "XXXXXXX":
+      EnvironmentType: Prod
+    "XXXXXXX":
+      EnvironmentType: Stg
+    "XXXXXXX":
+      EnvironmentType: Dev   
+
+
+Resources:
+ 
+  rFargateCluster:
+    Type: AWS::ECS::Cluster
+    Properties: 
+      ClusterName: !Sub
+            - Cluster${Env}
+            - { Env: !FindInMap [AccountToParams, !Ref "AWS::AccountId", EnvironmentType]} 
+      ClusterSettings: 
+        - Name: 'containerInsights'
+          Value: 'enabled'
+      Configuration:
+        ExecuteCommandConfiguration:
+          Logging: OVERRIDE
+          KmsKeyId:
+            Fn::ImportValue: !Sub '${pAlbStackName}-TargetAccountKMSKeyArn'  
+          LogConfiguration: 
+            CloudWatchLogGroupName: !Ref rFargateLogGroup
+      Tags:
+        - Key: Environment
+          Value: !FindInMap [AccountToParams, !Ref "AWS::AccountId", EnvironmentType]
+        - Key: Project
+          Value: Project
+
+  rFargateLogGroup: 
+    Type: AWS::Logs::LogGroup
+    Properties: 
+      LogGroupName : !Sub
+            - LogGroup-Cluster${Env}
+            - { Env: !FindInMap [AccountToParams, !Ref AWS::AccountId, EnvironmentType]}
+      KmsKeyId:
+        Fn::ImportValue: !Sub '${pAlbStackName}-TargetAccountKMSKeyArn'  
+      RetentionInDays: 7
+
+  rGreenFService:
+    Type: AWS::CloudFormation::Stack
+    DependsOn: 
+      - rEFSMountTarget1
+      - rEFSMountTarget2
+    Properties:
+      TemplateURL: !Sub https://${pTemplateBucket}.s3.amazonaws.com/02-FargateService.yml
+      Parameters:
+        pExecutionRole:
+          Fn::ImportValue: !Sub '${pAlbStackName}-ExecutionRole'  
+        pFargateLogGroup: !Ref rFargateLogGroup
+        pTaskRole:
+          Fn::ImportValue: !Sub '${pAlbStackName}-TaskRole' 
+        pClusterName: !Ref rFargateCluster
+        pPort: 8080
+        pSSLPort: 8443
+        pTag: !Ref pCode2
+        pDesiredCount: "1" 
+        pRepository: !Ref pRepository
+        pIdentifier: "Code2"
+        pIsProduction: False
+        pNetworkStackName: !Ref pNetworkStackName
+        pAlbStackName: !Ref pAlbStackName
+        pToolAccountId: !Ref pToolAccountId
+        pFileSystemId: !Ref rEFS
+
+  rBlueFService:
+    Type: AWS::CloudFormation::Stack
+    DependsOn: 
+      - rEFSMountTarget1
+      - rEFSMountTarget2
+    Properties:
+      TemplateURL: !Sub https://${pTemplateBucket}.s3.amazonaws.com/02-FargateService.yml
+      Parameters:
+        pExecutionRole:
+          Fn::ImportValue: !Sub '${pAlbStackName}-ExecutionRole'
+        pFargateLogGroup: !Ref rFargateLogGroup
+        pTaskRole:
+          Fn::ImportValue: !Sub '${pAlbStackName}-TaskRole'
+        pClusterName: !Ref rFargateCluster
+        pPort: 80
+        pSSLPort: 443
+        pTag: !Ref pCode1
+        pDesiredCount: 1
+        pRepository: !Ref pRepository
+        pIdentifier: "Code1"
+        pIsProduction: True
+        pNetworkStackName: !Ref pNetworkStackName
+        pAlbStackName: !Ref pAlbStackName
+        pToolAccountId: !Ref pToolAccountId
+        pFileSystemId: !Ref rEFS
+
+  #EFS
+  rEFS:  
+    Type: AWS::EFS::FileSystem
+    Properties:
+      Encrypted: true
+      FileSystemPolicy:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Action:
+              - elasticfilesystem:ClientMount
+              - elasticfilesystem:ClientWrite
+            Principal:
+              AWS: !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:role/TaskRole'
+      FileSystemTags:
+        - Key: Environment
+          Value: !FindInMap [AccountToParams, !Ref "AWS::AccountId", EnvironmentType]
+        - Key: Project
+          Value: Project
+      KmsKeyId :
+        Fn::ImportValue: !Sub '${pAlbStackName}-TargetAccountKMSKeyArn'
+      PerformanceMode: generalPurpose
+
+  rEFSMountTarget1:
+    Type: AWS::EFS::MountTarget
+    Properties: 
+      FileSystemId: !Sub '${rEFS.FileSystemId}' 
+      SecurityGroups: 
+        - !Ref rMountTargetSecurityGroup
+      SubnetId:
+        Fn::ImportValue: !Sub '${pNetworkStackName}-FargatePrivateSubnet1'
+
+  rEFSMountTarget2:
+    Type: AWS::EFS::MountTarget
+    Properties: 
+      FileSystemId: !Sub '${rEFS.FileSystemId}' 
+      SecurityGroups: 
+        - !Ref rMountTargetSecurityGroup
+      SubnetId: 
+        Fn::ImportValue: !Sub '${pNetworkStackName}-FargatePrivateSubnet2'
+
+  rMountTargetSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      VpcId:
+        Fn::ImportValue: !Sub '${pNetworkStackName}-VPCID'
+      GroupDescription: Security group for mount target
+      SecurityGroupIngress:
+      - IpProtocol: tcp
+        FromPort: '2049'
+        ToPort: '2049'
+        CidrIp:
+          Fn::ImportValue: !Sub '${pNetworkStackName}-VPCidrBlock'
+  
+  
+
+Outputs:
+  oClusterName:
+    Description: Cluster name
+    Value: !Ref rFargateCluster
+    Export:
+      Name: !Sub "${AWS::StackName}-FargateCluster"
+
+  oFargateLogGroup:
+    Description: LogGroup
+    Value: !Ref rFargateLogGroup
+    Export:
+      Name: !Sub "${AWS::StackName}-FargateLogGroup"

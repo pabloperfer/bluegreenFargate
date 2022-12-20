@@ -1,0 +1,286 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: Deploy AWS Service
+Metadata: 
+  AWS::CloudFormation::Interface: 
+    ParameterGroups: 
+      - Label: 
+          default: "Stack Names"
+        Parameters: 
+          - pAlbStackName
+          - pNetworkStackName
+          - pToolAccountId
+
+      - Label:
+          default: "Task Definition"
+        Parameters:
+         - pRepository
+         - pFargateLogGroup
+         - pTaskRole
+         - pExecutionRole
+
+      - Label:
+          default: "Service"
+        Parameters:
+         - pDesiredCount
+         - pClusterName
+
+      - Label:
+          default: "Target Group"
+        Parameters:
+         - pPort
+         - pSSLPort
+         - pIdentifier
+         - pTag
+         - pIsProduction
+
+      - Label:
+          default: "EFS"
+        Parameters:
+         - pFileSystemId
+
+    
+Parameters:
+
+  pAlbStackName:
+    Type: String
+    Description: 'Alb stack Name'
+  pNetworkStackName:
+    Type: String
+    Description: 'Network stack Name'
+  pToolAccountId:
+    Type: String
+
+
+  pRepository:
+    Type: String
+    Default: project/app
+  pFargateLogGroup:
+    Type: String
+  pExecutionRole:
+    Type: String
+  pTaskRole: 
+    Type: String
+
+  pDesiredCount:
+    Type: Number
+  pClusterName: 
+    Type: String
+  
+  pPort:
+    Type: String
+  pSSLPort:
+    Type: String
+  pIdentifier:
+    Type: String
+  pTag:
+    Type: String
+    Description: 'Docker Image Tag'
+  
+  pIsProduction:
+    Type: String
+  
+  pFileSystemId:
+    Type: String
+    Description: 'EFS file system id'
+
+
+
+Mappings:
+  AccountToParams:
+    "xxxxxxxxxx":
+      EnvironmentType: Prod
+    "xxxxxxxxxxx":
+      EnvironxmentType: Stg
+    "xxxxxxxxxxx":
+      EnvironmentType: Dev 
+
+  CertificateArn:
+    "Dev":
+      Arn: xxxxxxxxxxxxxxxxxxxxxx
+    "Stg":
+      Arn: xxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+    "Prod":
+      Arn: xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+
+
+
+Conditions:
+  cIsDev: !Equals [!FindInMap [AccountToParams, !Ref "AWS::AccountId", EnvironmentType], Dev ]
+  cIsStg: !Equals [!FindInMap [AccountToParams, !Ref "AWS::AccountId", EnvironmentType], Stg ]
+  cIsProd: !Equals [!FindInMap [AccountToParams, !Ref "AWS::AccountId", EnvironmentType], Prod ]
+  cIsProdLike: !Or
+    - !Equals [!FindInMap [AccountToParams, !Ref "AWS::AccountId", EnvironmentType], Prod ]
+    - !Equals [!FindInMap [AccountToParams, !Ref "AWS::AccountId", EnvironmentType], Stg ]
+
+
+
+Resources:
+
+  rALBListenerHTTP:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      DefaultActions:
+        - RedirectConfig:
+            Host: "#{host}"
+            Path: "/#{path}"
+            Port: !Ref pSSLPort
+            Protocol: "HTTPS"
+            Query: "#{query}"
+            StatusCode: HTTP_301
+          Type: "redirect"
+      LoadBalancerArn:
+        Fn::ImportValue: !Sub '${pAlbStackName}-LoadBalancerArn'
+      Port: !Ref pPort
+      Protocol: 'HTTP'
+      
+
+  rALBListenerHTTPS:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      Certificates:   
+        - CertificateArn: !If 
+          - cIsDev
+          - !FindInMap [CertificateArn, Dev, Arn]
+          - !If 
+            - cIsProd
+            - !FindInMap [CertificateArn, Prod, Arn]
+            - !If 
+              - cIsStg
+              - !FindInMap [CertificateArn, Stg, Arn]
+              - !Ref "AWS::NoValue"
+      DefaultActions:
+        - Type: forward
+          ForwardConfig:
+            TargetGroups:
+              - TargetGroupArn: !Ref 'rTargetGroup'
+                Weight: 1
+      LoadBalancerArn:
+        Fn::ImportValue: !Sub '${pAlbStackName}-LoadBalancerArn'
+      Port: !Ref pSSLPort
+      Protocol: HTTPS
+
+  
+  ALBListenerRuleForward:
+    Type: 'AWS::ElasticLoadBalancingV2::ListenerRule'
+    Properties:
+      Actions:
+        - Type: forward
+          ForwardConfig:
+            TargetGroups:
+              - TargetGroupArn: !Ref rTargetGroup
+                Weight: 1
+      ListenerArn: !Ref rALBListenerHTTPS
+      Conditions:
+        - Field: path-pattern
+          Values:
+          - "*"
+      Priority: 1
+
+  
+  rTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      HealthCheckIntervalSeconds: 7
+      HealthCheckPath: /
+      HealthCheckProtocol: HTTP
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 2
+      Matcher:
+        HttpCode: 200-399
+      Port: !Ref pPort
+      Protocol: HTTP
+      Tags:
+        - Key: Identifier
+          Value: !Ref pIdentifier
+        - Key: Image
+          Value: !Ref pTag
+        - Key: IsProduction
+          Value: !Ref pIsProduction
+      TargetType: ip
+      UnhealthyThresholdCount: 4
+      VpcId: 
+        Fn::ImportValue: !Sub '${pNetworkStackName}-VPCID' 
+     
+  rFargateService:
+    Type: AWS::ECS::Service
+    Properties:
+      Cluster: !Ref pClusterName
+      DesiredCount: !Ref pDesiredCount
+      LaunchType: FARGATE
+      LoadBalancers:
+        - ContainerName: service
+          ContainerPort: 80
+          TargetGroupArn: !Ref rTargetGroup
+      NetworkConfiguration: 
+        AwsvpcConfiguration:
+          AssignPublicIp: DISABLED
+          SecurityGroups:
+            - Fn::ImportValue: !Sub '${pNetworkStackName}-FargateSecurityGroup'
+          Subnets:
+            - Fn::ImportValue: !Sub '${pNetworkStackName}-FargatePrivateSubnet1'
+            - Fn::ImportValue: !Sub '${pNetworkStackName}-FargatePrivateSubnet2'
+      PlatformVersion: 1.4.0
+      Tags:
+        - Key: Environment
+          Value: !FindInMap [AccountToParams, !Ref "AWS::AccountId", EnvironmentType]
+        - Key: Project
+          Value: Project
+      TaskDefinition: !Ref rFargateTask
+
+  rFargateTask:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      ContainerDefinitions:
+        - Name: service
+          MountPoints: 
+            - 
+              SourceVolume: efs-test
+              ContainerPath: Any_Container_Path
+          Essential: true
+          Image: !Sub '${pToolAccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${pRepository}:${pTag}'
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-region: !Ref AWS::Region
+              awslogs-group: !Ref pFargateLogGroup
+              awslogs-stream-prefix: Project
+          PortMappings:
+            - ContainerPort: 80
+      Cpu: 512
+      ExecutionRoleArn: !Ref pExecutionRole
+      Family: example_task
+      Memory: 1024
+      NetworkMode: awsvpc
+      RequiresCompatibilities:
+        - FARGATE
+      TaskRoleArn: !Ref pTaskRole
+      Volumes: 
+        - Name: "efs-test"
+          EFSVolumeConfiguration:
+            AuthorizationConfig:
+              IAM: ENABLED
+            FilesystemId: !Ref pFileSystemId
+            TransitEncryption: ENABLED
+
+          
+Outputs:
+  OProdCertificateArn:
+    Condition: cIsProdLike
+    Description: Arn of the certificate for target group 
+    Value: !FindInMap [CertificateArn, Prod, Arn]
+    Export:
+      Name: !Sub "${AWS::StackName}-ProdCertificateArn"
+
+  OStgCertificateArn:
+    Condition: cIsProdLike
+    Description: Arn of the certificate for target group 
+    Value: !FindInMap [CertificateArn, Stg, Arn]
+    Export:
+      Name: !Sub "${AWS::StackName}-StgCertificateArn"
+
+  ODevCertificateArn:
+    Condition: cIsDev
+    Description: Arn of the certificate for target group 
+    Value: !FindInMap [CertificateArn, Dev, Arn]
+    Export:
+      Name: !Sub "${AWS::StackName}-DevCertificateArn"

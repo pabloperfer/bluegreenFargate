@@ -1,0 +1,390 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: Deploy ALB resources target accounts, this is dev,stg and prod.
+Metadata: 
+ AWS::CloudFormation::Interface: 
+   ParameterGroups: 
+    Label: 
+      default: "Network Stack"
+      Parameters: 
+        - pNetworkStackName
+    Label: 
+      default: "CodePipeline KMS"
+      Parameters: 
+        - ptoolKMSARN
+    Label: 
+      default: "Tool account ID"
+      Parameters: 
+        - pToolAccountId
+    Label: 
+      default: "S3 Buckets"
+      Parameters: 
+        - pS3SourceBucket
+        - pS3Artifactbucket
+
+Parameters:
+  pNetworkStackName:
+    Type: String
+    AllowedPattern: (^StackSet-)\S+
+    Description: 'Network stack Name from where this stack will import some required valaues to deploy the application load balancer'
+  ptoolKMSARN:
+    Type: String
+    AllowedPattern: arn:aws:kms:\S+:\d+:\w+\/\S+
+    Description: 'CodePipeline Kms'
+  pToolAccountId:
+    Type: String
+    Description: Tool account id
+  pS3SourceBucket:
+    Type: String
+    Default: ferpablo-template
+  pS3Artifactbucket:
+    Type: String
+    Default: artifact-bucket
+
+Mappings:
+  AccountToParams:
+    "xxxxxxxx":
+      EnvironmentType: Prod
+    "xxxxxxxx":
+      EnvironmentType: Stg
+    "xxxxxxxx":
+      EnvironmentType: Dev   
+
+Conditions:
+  cIsDev: !Equals [!FindInMap [AccountToParams, !Ref "AWS::AccountId", EnvironmentType], Dev ]
+  cIsStg: !Equals [!FindInMap [AccountToParams, !Ref "AWS::AccountId", EnvironmentType], Stg ]
+  cIsProd: !Equals [!FindInMap [AccountToParams, !Ref "AWS::AccountId", EnvironmentType], Prod ]
+
+Resources:
+  rApplicationLoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties: 
+      IpAddressType: ipv4
+      Name: ProjectALB
+      Scheme: !If [cIsDev,'internal', 'internet-facing']
+      SecurityGroups: 
+        - Fn::ImportValue: !Sub '${pNetworkStackName}-AlbSecurityGroup'
+      Subnets: !If 
+          - cIsDev
+          - - Fn::ImportValue: !Sub '${pNetworkStackName}-FargatePrivateSubnet1'
+            - Fn::ImportValue: !Sub '${pNetworkStackName}-FargatePrivateSubnet2'
+          - !If
+            - cIsStg
+            - - Fn::ImportValue: !Sub '${pNetworkStackName}-PublicSubnet1'
+              - Fn::ImportValue: !Sub '${pNetworkStackName}-PublicSubnet2'
+            - !If
+              - cIsProd
+              - - Fn::ImportValue: !Sub '${pNetworkStackName}-PublicSubnet1'
+                - Fn::ImportValue: !Sub '${pNetworkStackName}-PublicSubnet2'
+              - - !Ref "AWS::NoValue"
+      Tags: 
+      - Key: Name
+        Value: ALB
+      Type: application
+
+
+  rCFRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: CFNRole
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          -
+            Effect: Allow
+            Principal:
+              Service:
+                - cloudformation.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Path: /
+  rCFPolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: CFNRole
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          -
+            Effect: Allow
+            Action:
+              - cloudformation:*
+              - s3:*
+              - iam:PassRole
+              - iam:GetRole
+              - iam:PutRolePolicy
+              - iam:AttachRolePolicy
+              - iam:DetachRolePolicy
+              - ecr:*
+              - ecs:*
+              - ec2:*
+              - elasticfilesystem:*
+              - elasticloadbalancing:*
+              - logs:*
+              - secretsmanager:*
+              - kms:*
+            Resource: "*"
+      Roles:
+      - !Ref rCFRole
+
+  rCrossAccountRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: CrossAccount
+      AssumeRolePolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal: 
+              AWS: "arn:aws:iam::094872501017:root"
+            Action: 'sts:AssumeRole'
+      Path: / 
+      Policies:
+        - PolicyName: AllowSeveral
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: 
+                  - elasticloadbalancing:*
+                  - cloudformation:*
+                  - iam:*
+                  - ecr:*
+                  - ecs:*
+                  - elasticloadbalancing:*
+                  - logs:*
+                  - sts:*
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - kms:DescribeKey
+                  - kms:GenerateDataKey*
+                  - kms:Encrypt
+                  - kms:ReEncrypt*
+                  - kms:Decrypt
+                  - kms:RetireGrant
+                  - kms:CreateGrant
+                  - kms:RetireGrant
+                  - kms:DescribeKey
+                Resource: !Ref ptoolKMSARN
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                Resource:
+                  - !Sub arn:${AWS::Partition}:s3:::${pS3SourceBucket}/*
+                  - !Sub arn:${AWS::Partition}:s3:::${pToolAccountId}-${pS3Artifactbucket}/*
+              - Effect: Allow
+                Action:
+                  - s3:ListBucket
+                Resource:
+                  - !Sub arn:${AWS::Partition}:s3:::${pS3SourceBucket} 
+                  - !Sub arn:${AWS::Partition}:s3:::${pToolAccountId}-${pS3Artifactbucket}
+
+  rTaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: TaskRole
+      AssumeRolePolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: 'sts:AssumeRole'
+      Path: / 
+      Policies:
+        - PolicyName: AllowKMS
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: 
+                - kms:DescribeKey
+                - kms:GenerateDataKey*
+                - kms:Encrypt
+                - kms:ReEncrypt*
+                - kms:Decrypt
+                Resource: 
+                  - !Ref ptoolKMSARN
+                  - !Sub '${rTargetAccountKMSKey.Arn}'
+              - Effect: Allow
+                Action: 
+                  - ecr:BatchCheckLayerAvailability
+                  - ecr:BatchGetImage
+                  - ecr:CompleteLayerUpload
+                  - ecr:GetAuthorizationToken
+                  - ecr:GetDownloadUrlForLayer
+                  - ecr:InitiateLayerUpload
+                  - ecr:PutImage
+                  - ecr:UploadLayerPart
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                  - elasticfilesystem:ClientMount
+                  - elasticfilesystem:ClientWrite
+                Resource: "*"
+  rCrossLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: rCrossLambdaRole
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          -
+            Effect: Allow
+            Principal:
+              AWS:
+                - !Sub 'arn:aws:iam::${pToolAccountId}:role/lambda-blue-green-swap-role'
+            Action:
+                - sts:AssumeRole
+      Path: /
+
+  rBlueGreenFlipLambdaPolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: rCrossLambdaRole-policy
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+        - Effect: Allow
+          Action: 
+          - elasticloadbalancing:*
+          - codepipeline:PutJobFailureResult
+          - codepipeline:PutJobSuccessResult
+
+          Resource: "*"
+        - Effect: Allow
+          Action:
+          - logs:CreateLogGroup
+          - logs:CreateLogStream
+          - logs:PutLogEvents
+          Resource: arn:aws:logs:*:*:*
+      Roles:
+        - !Ref rCrossLambdaRole
+
+  rExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: ExecutionRole
+      AssumeRolePolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: 'sts:AssumeRole'
+      Path: / 
+      Policies:
+        - PolicyName: AllowKMS
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: 
+                - kms:DescribeKey
+                - kms:GenerateDataKey*
+                - kms:Encrypt
+                - kms:ReEncrypt*
+                - kms:Decrypt     
+                Resource: 
+                  - !Ref ptoolKMSARN
+                  - !Sub '${rTargetAccountKMSKey.Arn}'
+              - Effect: Allow
+                Action: 
+                  - ecr:BatchGetImage
+                  - ecr:CompleteLayerUpload
+                  - ecr:GetAuthorizationToken
+                  - ecr:GetDownloadUrlForLayer
+                  - ecr:InitiateLayerUpload
+                  - ecr:PutImage
+                  - ecr:UploadLayerPart
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: "*"
+
+  rTargetAccountKMSKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: symmetric CMK
+      EnableKeyRotation: true
+      PendingWindowInDays: 7
+      KeyPolicy:
+        Version: '2012-10-17'
+        Id: key-default-1
+        Statement:
+        - Sid: Allow
+          Effect: Allow
+          Principal:
+            AWS: 
+              - !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:root'
+              - !Sub 'arn:${AWS::Partition}:iam::${pToolAccountId}:root'  
+          Action: kms:*
+          Resource: '*'  
+        - Effect: Allow
+          Principal: 
+            Service: !Sub 'logs.${AWS::Region}.amazonaws.com'
+          Action: 
+          - kms:DescribeKey
+          - kms:GenerateDataKey*
+          - kms:Encrypt
+          - kms:ReEncrypt*
+          - kms:Decrypt
+          Resource: '*'   
+
+        - Effect: Allow 
+          Principal: 
+            Service: ecs-tasks.amazonaws.com
+          Action:
+          - kms:DescribeKey
+          - kms:GenerateDataKey*
+          - kms:Encrypt
+          - kms:ReEncrypt*
+          - kms:Decrypt
+          Resource: '*'
+
+    
+
+
+
+Outputs:
+  oALBUrl:
+    Description: URL of the load balancer for the service.
+    Value: !Sub http://${rApplicationLoadBalancer.DNSName}
+    Export:
+      Name: !Sub "${AWS::StackName}-ALBUrl"
+  oLoadBalancerArn:
+    Description: Arn of the load balancer for the service.
+    Value: !Ref rApplicationLoadBalancer
+    Export:
+      Name: !Sub "${AWS::StackName}-LoadBalancerArn"
+  oCrossAccountRole:
+    Description: Role to be assumed by Codepipeline Tool account
+    Value: !Ref rCrossAccountRole
+    Export:
+      Name: !Sub "${AWS::StackName}-CrossAccountRole"
+  oCrossLambdaRole:
+    Description: Lambda Role to be assumed by Tool accocunt
+    Value: !Ref rCrossLambdaRole
+    Export:
+      Name: !Sub "${AWS::StackName}-CrossLambdaRole"
+  oExecutionRole:
+    Description: Fargate Execution Role
+    Value: !Ref rExecutionRole
+    Export:
+      Name: !Sub "${AWS::StackName}-ExecutionRole"
+  oTaskRole:
+    Description: Fargate Task Role
+    Value: !Ref rTaskRole
+    Export:
+      Name: !Sub "${AWS::StackName}-TaskRole"
+  oTargetAccountKMSKeyId:
+    Description: Target KMS Key ID
+    Value: !Ref rTargetAccountKMSKey
+    Export:
+      Name: !Sub "${AWS::StackName}-TargetAccountKMSKeyId"
+  oTargetAccountKMSKeyArn:
+    Description: Target KMS Key Arn
+    Value: !Sub ${rTargetAccountKMSKey.Arn}
+    Export:
+      Name: !Sub "${AWS::StackName}-TargetAccountKMSKeyArn"
+
+
+
